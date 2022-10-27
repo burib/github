@@ -11,7 +11,7 @@ on:
 
       tf_version:
         description: 'Terraform version to run'
-        default: '1.3.0'
+        default: 'latest'
         required: false
         type: string
 
@@ -23,13 +23,13 @@ on:
 
       tflint_config_repo:
         description: 'Public Repo Where TFLint Config can be found'
-        default: 'burib/workflows'
+        default: 'burib/tflint-configs'
         required: false
         type: string
 
       tflint_config_path:
         description: 'Path inside the Public Repo Where TFLint Config can be found'
-        default: 'configs/aws.tflint.hcl'
+        default: 'aws/.tflint.hcl'
         required: false
         type: string
 
@@ -44,6 +44,10 @@ on:
         default: ''
         required: false
         type: string
+
+    secrets:
+      GH_READ_ONLY_TOKEN:
+        required: false # provide READ ONLY PAT if you use private Github repos as terraform code.
 
 jobs:
   format:
@@ -69,7 +73,7 @@ jobs:
       - name: Add & Commit
         uses: EndBug/add-and-commit@v9.1.0
         with:
-          author_name: 'github-actions[bot]'
+          author_name: 'github-actions[bot] :robot:'
           author_email: 'github-actions[bot]@users.noreply.github.com'
           message: 'fix: terraform fmt'
 
@@ -88,6 +92,23 @@ jobs:
         uses: hashicorp/setup-terraform@v1
         with:
           terraform_version: ${{ inputs.tf_version }}
+
+      - name: Terraform version
+        working-directory: ./${{ inputs.working_directory }}
+        id: version
+        run: terraform --version
+        continue-on-error: false
+
+      - name: 'set env variables'
+        run: |
+          IFS='/' read -ra GITHUB_REPOSITORY <<< ${{ github.repository }}
+          echo "GITHUB_ORGANISATION_NAME=${GITHUB_REPOSITORY[0]}" >> $GITHUB_ENV
+          echo "GITHUB_REPOSITORY_NAME=${GITHUB_REPOSITORY[1]}" >> $GITHUB_ENV
+
+      - name: "Configure Github credentials"
+        run: |
+          git config --local --remove-section http."https://github.com/"
+          git config --global url."https://cicd:${{ secrets.GH_READ_ONLY_TOKEN }}@github.com/".insteadOf "https://github.com/"
 
       - name: Terraform init
         id: init
@@ -133,7 +154,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v3
       - name: tfsec
-        uses: aquasecurity/tfsec-action@v1.0.0
+        uses: aquasecurity/tfsec-action@v1.0.2
+        id: tfsec
+        with:
+          format: "default,sarif"
+          additional_args: "--out tfsec_results.sarif"
+        continue-on-error: true
+      - name: "Upload tfsec SARIF file to github code scanning"
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: tfsec_results.sarif
+        continue-on-error: true
+      - name: "Check if TFSec Failed or not"
+        if: steps.tfsec.outcome != 'success'
+        run: echo "tfsec failed." && exit 1
 
 
   checkov:
@@ -144,16 +178,36 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v3
 
+      - name: "Configure Github credentials"
+        run: |
+          git config --local --remove-section http."https://github.com/"
+          git config --global url."https://cicd:${{ secrets.GH_READ_ONLY_TOKEN }}@github.com/".insteadOf "https://github.com/"
+
       - name: Run Checkov
         id: checkov
-        uses: bridgecrewio/checkov-action@master
+        uses: burib/checkov-action@upgrade-docker-image-version
+        env:
+          GH_READ_ONLY_TOKEN: ${{ secrets.GH_READ_ONLY_TOKEN }}
         with:
           check: ${{ inputs.checkov_check }}
           skip_check: ${{ inputs.checkov_skip_check }}
           soft_fail: false
           framework: terraform
-          download_external_modules: false
-          log_level: WARNING
+          output_format: sarif # optional: the output format, one of: cli, json, junitxml, github_failed_only, or sarif. Default: sarif
+          output_file_path: checkov_results.sarif # folder and name of results file
+          download_external_modules: true
+          github_pat: "GH_READ_ONLY_TOKEN"
+          log_level: DEBUG
+        continue-on-error: true
+
+      - name: "Upload checkov SARIF file to github code scanning"
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: checkov_results.sarif
+        continue-on-error: true
+      - name: "Check if Checkov Failed or not"
+        if: steps.tfsec.checkov != 'success'
+        run: echo "checkov failed." && exit 1
 
   docs:
     name: Terraform Docs
